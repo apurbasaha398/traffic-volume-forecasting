@@ -8,3 +8,6 @@ For this project, TMAS dataset was used, which can be found at [Federal Highway 
 
 ## Project Description
 For this project, traffic data for the years 2018 and 2019 was retrieved from the FHWA TMAS dataset. To enhance the analysis, additional features were created to capture time-series information, including day of the week, day of the month, month, long weekends, holidays, lags, and more. Traditional statistical time-series models like Linear regression, ETS (Error, Trend, Seasonality) and SARIMA (Seasonal Autoregressive Integrated Moving Average), ARIMAX, Decomposition were used to fit the data. A comparison between these models were made to identify which approach offers better predictive accuracy in terms of MAPE and RMSSE score. Finally, meaningful insights were derived from the time-series analysis that can help identify key factors influencing traffic volume.
+
+## Project Code
+The code for this project has been published publicly on RPub. Please visit [this link](https://rpubs.com/apurbasaha398/1148705) to see the code.
