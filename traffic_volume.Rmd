@@ -1,0 +1,788 @@
+---
+title: "Predic traffic volume in AZ"
+output: html_notebook
+---
+
+Highest traffic in I-10 Phoenix: Near Loop 101. Traffic count in that area tracked by ATR Station 100086. Need to forecast daily traffic volume
+
+```{r}
+rm(list = ls())
+```
+
+
+```{r warning=FALSE}
+library(dygraphs)
+library(fpp3)
+```
+
+
+```{r}
+# read the data
+origin = read.csv("AZ_traffic.csv")
+```
+
+```{r}
+head(origin)
+```
+```{r}
+df <- origin |> filter(Station_Id == 100086)
+```
+
+```{r}
+head(df)
+```
+
+
+```{r}
+df[['datetime']] <- as.POSIXct(df[['datetime']],
+                                   format = "%Y-%m-%d %H:%M:%S")
+head(df)
+```
+
+```{r}
+unique(df$Travel_Lane)
+```
+```{r}
+unique(df$Travel_Dir)
+```
+
+```{r}
+df <- df |> select(-c('Travel_Lane', 'Station_Id')) |>
+  mutate(date=as.Date(datetime))
+head(df)
+```
+
+
+```{r}
+df <- df |> select(-datetime) |>
+      group_by(Travel_Dir, date) |>
+      summarise(daily_volume = sum(Hour_Volume)) |> 
+      ungroup()
+head(df)
+```
+
+```{r}
+df <- df |>
+  as_tsibble(index = date,
+             key = Travel_Dir)
+df
+```
+
+```{r}
+library(tsbox)
+tsbox::ts_xts(df) |>
+  dygraph() |> 
+  dyRangeSelector(dateWindow = c("2018-01-01", "2019-12-30"))
+```
+
+We notice some unusually low traffic flow for some data points. After closer inspection, we observe that there are some missing dates in the time-series for which no traffic count is available. This is because ATR tracker was out of order in those days. In some cases, the tracker stopped functioning in the middle of the day. For those dates, we also observe very low traffic flow. That's we will treat this partial records as missing values.
+
+```{r}
+threshold = 61000
+errors <- df |>
+  filter(daily_volume < threshold)
+df <- df |> anti_join(errors)
+```
+```{r}
+df <- df |> fill_gaps()
+```
+
+```{r}
+library(tsbox)
+tsbox::ts_xts(df) |>
+  dygraph() |> 
+  dyRangeSelector(dateWindow = c("2018-01-01", "2019-12-30"))
+```
+
+```{r}
+missing_data <- df |> filter(is.na(daily_volume))
+```
+
+
+```{r}
+proxy <- origin |> filter(Station_Id == 100087)
+proxy$date <- as.Date(proxy$datetime, format = "%Y-%m-%d")
+proxy <- proxy |> select(-c('Travel_Lane', 'Station_Id'))
+proxy <- proxy |> select(-datetime) |>
+      group_by(Travel_Dir, date) |>
+      summarise(daily_volume = sum(Hour_Volume)) |> 
+      ungroup()
+proxy <- proxy |> as_tsibble(index = date, key = Travel_Dir)
+proxy
+```
+```{r}
+df <- df %>%
+  left_join(proxy, by = c("date", "Travel_Dir"), suffix = c("", "_tsb2")) %>%
+  mutate(daily_volume = coalesce(daily_volume, daily_volume_tsb2)) %>% # coalesce finds the first non-missing value
+  select(-daily_volume_tsb2)
+
+head(df)
+```
+
+```{r}
+library(tsbox)
+tsbox::ts_xts(df) |>
+  dygraph() |> 
+  dyRangeSelector(dateWindow = c("2018-01-01", "2019-12-30"))
+```
+
+```{r}
+df |> has_gaps()
+```
+Data also missing in proxy
+
+```{r}
+na_count <- sum(is.na(df$daily_volume))
+print(na_count)
+```
+```{r}
+df |> filter(is.na(daily_volume))
+```
+```{r}
+library(imputeTS)
+
+# Impute missing values using linear interpolation
+df <- df %>%
+  group_by(Travel_Dir) %>%
+  mutate(daily_volume = na_interpolation(daily_volume, option = "linear"))
+```
+
+```{r}
+na_count <- sum(is.na(df$daily_volume))
+print(na_count)
+```
+
+```{r}
+df |>
+  autoplot(daily_volume)
+```
+
+```{r}
+df |>
+  gg_season(daily_volume, period = "year", pal = c("#3333FF", "#FF3333")) +
+  theme(legend.position = "left") +
+  labs(y="Daily traffic count", title="Traffic volume by year") +
+  facet_wrap(vars(Travel_Dir))
+```
+We notice an increasing trend over the years. Moreover, we observe an annual seasonal pattern. Traffic count is lowest in summer due to extreme heat, keeps increasing from October to December due to tourism. Traffic is highest in December because of the vacation season. Then the winter starts. So, the traffic flow is comparatively low in January and February. Then again, a spike in traffic volume can be observed in March and April due to tourism.
+
+```{r}
+df |>
+  gg_season(daily_volume, period = "week") +
+  theme(legend.position = "none") +
+  labs(y="Daily traffic count", x="Day of the week", title="Traffic Volume per week")
+```
+We notice weakly seasonality. Traffic count on weekend is a significantly lower than weekdays.
+
+```{r}
+df |>
+  gg_season(daily_volume, period = "month") +
+  theme(legend.position = "none") +
+  labs(y="Daily traffic count", x="Week of the month", title="Traffic Volume per month")
+```
+No monthly seasonality can be observed
+
+```{r}
+df |>
+  index_by(month = yearmonth(date)) |>
+  summarize(monthly_volume = sum(daily_volume)) |>
+  gg_subseries(monthly_volume, period = 'year')
+```
+We also observe an annual pattern in this subseries plot as well.
+
+```{r}
+df |>
+  gg_subseries(daily_volume, period = 'month') +
+  theme(axis.text = element_blank(), axis.ticks = element_blank())
+```
+No significant monthly pattern
+
+```{r}
+df |>
+  gg_subseries(daily_volume, period = 'week')
+```
+Same weakly pattern as seasonal plot. Less traffic on weekends. Using multiple plots, we confirm the presence of weekly seasonality
+
+```{r fig.width=15,fig.height=5}
+df |> filter(Travel_Dir == '3') |>
+  ACF(daily_volume, lag_max = 33) |> autoplot()
+```
+
+```
+{r fig.width=5,fig.height=5}
+library(sugrrants)
+p <- df |> filter(Travel_Dir == '3') |>
+  mutate(date = as.Date(datetime)) |>
+  filter(year(datetime) == 2018) |>
+  frame_calendar(x = hour(datetime), y = hour_volume, date=date) |>
+  ggplot(aes(x = `.hour(datetime)`, y = `.hour_volume`, group=date)) +
+  geom_line()
+
+prettify(p)
+```
+```{r fig.width=8,fig.height=8}
+dcmp <- df |> filter(Travel_Dir == '3') |>
+  model(STL(daily_volume ~ trend(window=120) + season("week", window='periodic'), robust=TRUE)) #trend(window = 90) + season('week', window=30)))
+components(dcmp)|> autoplot()
+```
+```{r}
+components(dcmp) |>
+  as_tsibble() |>
+  autoplot(daily_volume, colour="gray") +
+  geom_line(aes(y=trend), colour = "#D55E00") +
+  labs(
+    y = "Traffic Volume"
+  )
+```
+From the decomposition plot, it is evident that the trend and weekly seasonality is a small part of the data. There are too much noise left in the remainder. We need some explanatory factors to explain this source of noise.
+
+```{r}
+df |>
+  features(daily_volume, feat_stl)
+```
+
+```{r}
+# Extract day of the week, day of the month, month, and year
+df <- df %>%
+  mutate(day_of_week = wday(date, label=TRUE),                              # Day of the week (e.g., Mon, Tue)
+         week_of_month = week(date) - week(floor_date(date, "month")) + 1,
+         month = month(date, label=TRUE))                                   # Month (e.g., Jan, Feb)
+```
+
+```{r}
+head(df)
+```
+```{r}
+df$week_of_month = factor(df$week_of_month, ordered = TRUE)
+head(df)
+```
+We can also consider holidays like July 4th (independence day), Thanksgiving (November 23rd), etc. So, we need to add an indicator column for holidays as well.
+
+```{r}
+# Define commonly observed holidays in the USA
+holidays <- c("2017-01-01", "2017-01-16", "2017-02-20", "2017-05-29", "2017-07-04", "2017-09-04", "2017-10-09", "2017-11-11", "2017-11-23", "2017-11-24", "2017-12-24", "2017-12-25", "2017-12-31",
+                "2018-01-01", "2018-01-15", "2018-02-19", "2018-05-28", "2018-07-04", "2018-09-03", "2018-10-08", "2018-11-11", "2018-11-22", "2018-11-23", "2018-12-24", "2018-12-25", "2018-12-31",
+                "2019-01-01", "2019-01-21", "2019-02-18", "2019-05-27", "2019-07-04", "2019-09-02", "2019-10-14", "2019-11-11", "2019-11-28", "2019-11-29", "2019-12-24", "2019-12-25", "2019-12-31")
+```
+
+
+```{r}
+# Function to check if a date is a holiday in the USA
+is_us_holiday <- function(date) {
+  return(as.numeric(as.character(date) %in% holidays))
+}
+
+# Create 'is_holiday' column and set default value to FALSE
+df$is_holiday <- 0
+
+# Iterate through rows and set the 'is_holiday' indicator based on the date
+for (i in 1:nrow(df)) {
+  date <- df$date[i]
+  year <- year(date)
+  df$is_holiday[i] <- is_us_holiday(paste(year, format(date, "-%m-%d"), sep = ""))
+}
+```
+
+
+```{r}
+head(df)
+```
+```{r}
+is_long_weekend <- function(date, holidays) {
+  weekdays <- wday(date)
+  is_holiday <- date %in% as.Date(holidays)
+  is_friday_or_monday <- weekdays %in% c(2, 6)  # Monday or Friday
+
+  ifelse(is_holiday & is_friday_or_monday, 1, 0)
+}
+
+df$is_long_weekend <- is_long_weekend(df$date, holidays)
+```
+
+```{r}
+head(df)
+```
+```{r}
+# Define a function to check if a date is within Thanksgiving week
+is_thanksgiving_week <- function(date) {
+  # Calculate Thanksgiving date (fourth Thursday in November)
+  first_november <- as.Date(paste0(year(date), "-11-01"))
+  offset <- 22 + (11 - as.numeric(format(first_november, "%w"))) %% 7
+  thanksgiving_date <- as.Date(paste0(year(date), "-11-", offset))
+  
+  # Check if the date is within the week of Thanksgiving
+  return(ifelse(date >= thanksgiving_date - days(3) & date <= thanksgiving_date + days(3), 1, 0))
+}
+
+# Define a function to check if a date is within Christmas week
+is_christmas_week <- function(date) {
+  # Assuming Christmas week is the week of December 25th
+  return(ifelse(week(date) == week(as.Date(paste0(year(date), "-12-25"))), 1, 0))
+}
+
+# Define a function to check if a date is within the New Year season
+is_new_year_season <- function(date) {
+  # Assuming New Year season is from December 28th to January 3rd
+  january_condition <- date >= (as.Date(paste0(year(date), "-12-28")) - years(1)) & date <= as.Date(paste0(year(date), "-01-03"))
+  december_condition <- date >= as.Date(paste0(year(date), "-12-28")) & date <= (as.Date(paste0(year(date), "-01-03")) + years(1))
+  return(ifelse(january_condition || december_condition, 1, 0))
+}
+
+# Add indicator columns for Thanksgiving week, Christmas week, and New Year season
+df <- df |>
+  mutate(
+    is_thanksgiving_week = sapply(date, is_thanksgiving_week),
+    is_christmas_week = sapply(date, is_christmas_week),
+    is_new_year_season = sapply(date, is_new_year_season)
+  )
+```
+
+
+```{r}
+df$is_long_weekend_lag2 <- lag(df$is_long_weekend, 2, default = -1)
+df$is_long_weekend_lag1 <- lag(df$is_long_weekend, 1, default = -1)
+df$is_long_weekend_lead2 <- lead(df$is_long_weekend, 2, default = -1)
+df$is_long_weekend_lead1 <- lead(df$is_long_weekend, 1, default = -1)
+
+df$is_holiday_lag1 <- lag(df$is_holiday, 1, default = -1)
+df$is_holiday_lead1 <- lead(df$is_holiday, 1, default = -1)
+
+df$daily_volume_lag1 <- lag(df$daily_volume, 1, default = -1)
+df$daily_volume_lag2 <- lag(df$daily_volume, 2, default = -1)
+df$daily_volume_lag3 <- lag(df$daily_volume, 3, default = -1)
+df$daily_volume_lag4 <- lag(df$daily_volume, 4, default = -1)
+df$daily_volume_lag5 <- lag(df$daily_volume, 5, default = -1)
+df$daily_volume_lag6 <- lag(df$daily_volume, 6, default = -1)
+df$daily_volume_lag7 <- lag(df$daily_volume, 7, default = -1)
+```
+
+```{r}
+head(df)
+```
+
+```{r}
+save(df, file="processed_data")
+```
+
+```{r}
+load("processed_data")
+```
+
+```
+test_gaps <- test |> 
+  count_gaps()
+test_gaps
+```
+```
+ggplot(test_gaps, aes(x = Station_Location, colour = Station_Location)) +
+  geom_linerange(aes(ymin = .from, ymax = .to)) +
+  geom_point(aes(y = .from)) +
+  geom_point(aes(y = .to)) +
+  coord_flip() +
+  theme(legend.position = "none")
+```
+We want to forecast the hourly traffic for next two weeks. So, we create a test dataset with only last two weeks of data.
+
+Train-test split
+
+```{r}
+# Identify the cutoff point for the training data (all data except the last two weeks)
+training_cutoff <- max(df$date) - 30
+
+# Create training and test datasets
+train <- df %>% filter(date < training_cutoff)
+test <- df %>% filter(date >= training_cutoff)
+```
+
+```{r}
+head(test)
+```
+
+Set the baseline model
+
+```{r fig.width=10,fig.height=5}
+baseline_fit <- train |> filter(Travel_Dir == '3') |>
+                model(Mean = MEAN(daily_volume),
+                      `Naïve` = NAIVE(daily_volume),
+                      `Seasonal_naïve_week` = SNAIVE(daily_volume ~ lag('week')),
+                       Drift = NAIVE(daily_volume ~ drift())
+                     )
+
+# Generate forecasts for 14 quarters
+baseline_fc <- baseline_fit |> forecast(h = 31)
+# Plot forecasts against actual values
+baseline_fc |>
+  autoplot(train |> filter(Travel_Dir == '3') |> tail(30*6), level = NULL) +
+  autolayer(
+    filter_index(test |> filter(Travel_Dir == '3'), "2019-12-02" ~ "2019-12-31"),
+    colour = "black"
+  ) +
+  labs(
+    y = "Traffic Count",
+    title = "Forecasts for daily traffic volume"
+  ) +
+  guides(colour = guide_legend(title = "Forecast"))
+```
+```{r}
+accuracy( baseline_fc, df|> filter(Travel_Dir == '3')) |> select(.model, MAPE, RMSE, RMSSE)
+```
+So, the 'mean' model performs best.
+
+```{r}
+baseline_fit |> select(Mean) |> gg_tsresiduals()
+```
+```{r}
+head(train)
+```
+# Linear Regression
+
+```{r}
+dummy_vars <- model.matrix(~ week_of_month + day_of_week + month - 1, data = train)
+train_reg <- cbind(train, dummy_vars) |> select(-week_of_month, -day_of_week, -month)
+head(train_reg)
+```
+
+```{r}
+train_sample <- train_reg |> filter(Travel_Dir == 3)
+head(train_sample)
+```
+
+```{r}
+library(leaps)
+back <- regsubsets(daily_volume ~ . -daily_volume -Travel_Dir -week_of_month6 -date, data = train_sample, nvmax=40, method="backward")
+coefficient.regfitBack <- coef(back, 1:40)
+
+train.mat <- model.matrix(daily_volume ~ . -daily_volume -Travel_Dir -week_of_month6 -date, data = train_sample)
+trainErrorBackward = rep(NA, 40)
+for (i in 1:40) {
+  coefficient = coef(back, id=i)
+  prediction = train.mat[,names(coefficient)]%*%coefficient
+  trainErrorBackward[i] = mean((train_sample$daily_volume - prediction)^2)
+}
+cat("Training errors:\n")
+trainErrorBackward
+```
+```{r}
+nTrain = nrow(train_sample)
+linreg.bic = nTrain*log(trainErrorBackward) + log(nTrain)*c(seq(2,41,1))
+linreg.bic
+```
+```{r}
+bestlinreg.bic = which.min(linreg.bic)
+bestlinreg.bic
+```
+```{r}
+bestcoeff.bic = coef(back,id=bestlinreg.bic)
+cat("The selected variables according to BIC criteria:\n")
+names(bestcoeff.bic)
+```
+
+```{r}
+linreg.aic <- nTrain*log(trainErrorBackward) + 2*c(seq(2,41,1))
+linreg.aic
+```
+```{r}
+bestlinreg.aic = which.min(linreg.aic)
+bestlinreg.aic
+```
+```{r}
+bestcoeff.aic = coef(back,id=bestlinreg.aic)
+cat("The selected variables according to AIC criteria:\n")
+names(bestcoeff.aic)
+```
+```{r}
+tsregFormula.bic <- as.formula(paste("daily_volume ~ trend() + ", paste0(names(bestcoeff.bic)[-1], collapse = " + ")))
+tsregFormula.bic
+```
+
+
+```{r}
+fit_linreg.bic <- train_reg |>
+  model(tslm = TSLM(tsregFormula.bic))
+```
+
+```{r}
+fit_linreg.bic |> filter(Travel_Dir == 3) |> report()
+```
+```{r}
+fit_linreg.bic |> filter(Travel_Dir == 3) |> augment() |>
+  ggplot(aes(x = date)) +
+  geom_line(aes(y = daily_volume, colour = "Data")) +
+  geom_line(aes(y = .fitted, colour = "Fitted")) +
+  labs(y = NULL,
+    title = "Fitted traffic volume"
+  ) +
+  scale_colour_manual(values=c(Data="black",Fitted="#D55E00")) +
+  guides(colour = guide_legend(title = NULL))
+```
+```{r}
+fit_linreg.bic |> filter(Travel_Dir == 3) |> gg_tsresiduals()
+```
+```{r}
+fit_linreg.bic |> augment() |>
+  features(.innov, ljung_box, lag = 14)
+```
+As p-value is less than 0.05, we conclude that the residuals are significantly distinguishable from the white noise.
+
+```{r}
+fit_linreg.bic |> filter(Travel_Dir == 3) |> augment() |>
+  ggplot(aes(x = .fitted, y = .resid)) +
+  geom_point() + labs(x = "Fitted", y = "Residuals")
+```
+```{r}
+dummy_vars <- model.matrix(~ week_of_month + day_of_week + month - 1, data = test)
+test_reg <- cbind(test, dummy_vars) |> select(-week_of_month, -day_of_week, -month)
+test_reg
+```
+
+```{r}
+linreg.bic.fc <- fit_linreg.bic |> forecast(new_data = test_reg)
+accuracy(linreg.bic.fc, df) |> select(.model, MAPE, RMSSE)
+```
+
+
+```{r}
+tsregFormula.aic <- as.formula(paste("daily_volume ~ trend() + ", paste0(names(bestcoeff.aic)[-1], collapse = " + ")))
+tsregFormula.aic
+```
+```{r}
+fit_linreg.aic <- train_reg |>
+  model(tslm = TSLM(tsregFormula.aic))
+```
+
+```{r}
+fit_linreg.aic |> filter(Travel_Dir == 7) |> report()
+```
+```{r}
+fit_linreg.aic |> filter(Travel_Dir == 3) |> augment() |>
+  ggplot(aes(x = date)) +
+  geom_line(aes(y = daily_volume, colour = "Data")) +
+  geom_line(aes(y = .fitted, colour = "Fitted")) +
+  labs(y = NULL,
+    title = "Fitted traffic volume"
+  ) +
+  scale_colour_manual(values=c(Data="black",Fitted="#D55E00")) +
+  guides(colour = guide_legend(title = NULL))
+```
+
+
+```{r}
+fit_linreg.aic |> filter(Travel_Dir == 3) |> gg_tsresiduals()
+```
+```{r}
+fit_linreg.aic |> augment() |>
+  features(.innov, ljung_box, lag = 14)
+```
+As p-value is less than 0.05 for Travel_Dir 7, we conclude that the residuals for that series are significantly distinguishable from the white noise.
+
+```{r}
+fit_linreg.aic |> filter(Travel_Dir == 3) |> augment() |>
+  ggplot(aes(x = .fitted, y = .resid)) +
+  geom_point() + labs(x = "Fitted", y = "Residuals")
+```
+```{r}
+linreg.aic.fc <- fit_linreg.aic |> forecast(new_data = test_reg)
+accuracy(linreg.aic.fc, df) |> select(.model, MAPE, RMSSE)
+```
+# Decompositon method (Naive Bayes + Linear Regression)
+
+```{r}
+fit_dcmp <- train_reg |>
+  model(stlf = decomposition_model(
+    STL(daily_volume ~ trend(window=120) + season("week", window=60), robust=TRUE),
+    TSLM(season_adjust ~ trend() + is_holiday + is_long_weekend + is_thanksgiving_week + 
+                        is_new_year_season + is_long_weekend_lag2 + is_long_weekend_lag1 + 
+                        is_long_weekend_lead2 + lag(season_adjust, 1) + lag(season_adjust, 6) + 
+                        week_of_month1 + month.C + `month^4` + `month^7`+`month^8`)
+  ))
+```
+
+```{r}
+fit_dcmp |> filter(Travel_Dir == 7) |> gg_tsresiduals()
+```
+
+```{r}
+fit_dcmp |> augment() |>
+  features(.innov, ljung_box, lag = 14)
+```
+```{r}
+fit_dcmp |> filter(Travel_Dir == 3) |> augment() |>
+  ggplot(aes(x = .fitted, y = .innov)) +
+  geom_point() + labs(x = "Fitted", y = "Residuals")
+```
+```{r}
+fit_dcmp |> filter(Travel_Dir == 3) |> augment() |> filter(.resid > 20000)
+```
+
+
+```{r}
+dcmp_test_dir3 <- test_reg |> filter(Travel_Dir == '3') |>
+  model(STL(daily_volume ~ trend(window=120) + season("week", window=60), robust=TRUE)) #trend(window = 90) + season('week', window=30)))
+
+dcmp_test_dir7 <- test_reg |> filter(Travel_Dir == '7') |>
+  model(STL(daily_volume ~ trend(window=120) + season("week", window=60), robust=TRUE))
+```
+
+
+```{r}
+test_dcmp_dir3 <- test_reg |> filter(Travel_Dir == 3) |>
+  mutate(season_adjust = components(dcmp_test_dir3) |> pull(season_adjust))
+test_dcmp_dir7 <- test_reg |> filter(Travel_Dir == 7) |>
+  mutate(season_adjust = components(dcmp_test_dir7) |> pull(season_adjust))
+test_dcmp <- bind_rows(test_dcmp_dir3, test_dcmp_dir7)
+test_dcmp
+```
+
+```{r}
+dcmp_fc <- fit_dcmp |> forecast(new_data = test_dcmp)
+accuracy(dcmp_fc, df) |> select(.model, MAPE, RMSSE)
+```
+# SARIMA
+
+```{r}
+train |>
+  features(daily_volume, unitroot_kpss)
+```
+So, the data is not stationary
+
+```{r}
+train |>
+  features(daily_volume, unitroot_nsdiffs)
+```
+one seasonal difference is necessary
+
+```{r}
+train |> mutate(daily_volume = difference(daily_volume, 7)) |>
+  features(daily_volume, unitroot_ndiffs)
+```
+No first difference is necessary
+
+```{r}
+train |> filter(Travel_Dir == 3) |>
+  gg_tsdisplay(difference(daily_volume, 7),
+               plot_type='partial', lag=100) +
+  labs(title="Seasonally differenced", y="")
+```
+D = 1, d = 0, Q = 0, P = 6, p = 39, q = 0
+
+```{r}
+fit <- train |>
+  model(
+    auto = ARIMA(daily_volume, stepwise = FALSE, approx = FALSE)
+  )
+```
+
+```{r}
+fit
+```
+```{r}
+glance(fit) |> arrange(AICc) |> select(Travel_Dir:BIC)
+```
+
+```{r fig.width = 7}
+fit |> filter(Travel_Dir == 3) |> select(auto) |> gg_tsresiduals(lag=36)
+```
+```{r}
+augment(fit) |>
+  filter(.model == "auto") |>
+  features(.innov, ljung_box, lag=24, dof=4)
+```
+```{r}
+arima_fc <- fit |> forecast(new_data = test)
+accuracy(arima_fc, df) |> select(.model, MAPE, RMSSE)
+```
+# Dynamic regression
+
+```{r}
+head(train_reg)
+```
+```{r}
+tsregFormula.aic
+```
+
+```{r}
+fit_dynreg <- train_reg |>
+  model(ARIMA(daily_volume ~ trend() + is_holiday + is_long_weekend + is_thanksgiving_week + 
+    is_new_year_season + is_long_weekend_lag2 + is_long_weekend_lag1 + 
+    is_long_weekend_lead2 + daily_volume_lag1 + daily_volume_lag6 + 
+    week_of_month1 + day_of_week.L + day_of_week.Q + day_of_week.C + 
+    `day_of_week^4` + `day_of_week^5` + `day_of_week^6` + month.C + 
+    `month^4` + `month^7` + `month^8` + pdq(3,0,0) + PDQ(1,0,2)))
+```
+
+```{r rows.print = 28}
+coefficients(fit_dynreg |> filter(Travel_Dir==7))
+```
+```{r}
+bind_rows(
+    `Regression residuals` =
+        as_tibble(residuals(fit_dynreg |> filter(Travel_Dir==3), type = "regression")),
+    `ARIMA residuals` =
+        as_tibble(residuals(fit_dynreg |> filter(Travel_Dir==3), type = "innovation")),
+    .id = "type"
+  ) |>
+  mutate(
+    type = factor(type, levels=c(
+      "Regression residuals", "ARIMA residuals"))
+  ) |>
+  ggplot(aes(x = date, y = .resid)) +
+  geom_line() +
+  facet_grid(vars(type))
+```
+```{r}
+fit_dynreg |> filter(Travel_Dir==3) |> gg_tsresiduals()
+```
+```{r}
+augment(fit_dynreg) |>
+  features(.innov, ljung_box, lag = 14)
+```
+```{r}
+dynreg_fc <- fit_dynreg |> forecast(new_data = test_reg)
+accuracy(dynreg_fc, df) |> select(.model, MAPE, RMSSE)
+```
+# Decomposition (Naive Bayes + Dynamic Regression)
+
+```{r}
+fit_arima_dcmp <- train_reg |>
+  model(stlf = decomposition_model(
+    STL(daily_volume ~ trend(window=120) + season("week", window=60), robust=TRUE),
+    ARIMA(season_adjust ~ trend() + is_holiday + is_long_weekend + is_thanksgiving_week + 
+                        is_new_year_season + is_long_weekend_lag2 + is_long_weekend_lag1 + 
+                        is_long_weekend_lead2 + lag(season_adjust, 1) + lag(season_adjust, 2) + lag(season_adjust, 3) +
+                        month.C + `month^4` + `month^7` + `month^8` + `month^9`, stepwise = FALSE, approximation = FALSE)
+  ))
+```
+
+```{r}
+fit_arima_dcmp |> filter(Travel_Dir == 3) |> gg_tsresiduals()
+```
+
+```{r}
+fit_arima_dcmp |> filter(Travel_Dir == 3) |> report()
+```
+
+
+```{r}
+augment(fit_arima_dcmp) |>
+  features(.innov, ljung_box, lag = 14)
+```
+```{r}
+dcmp_arima_fc <- fit_arima_dcmp |> forecast(new_data = test_dcmp)
+accuracy(dcmp_arima_fc, df) |> select(.model, MAPE, RMSSE)
+```
+```{r}
+fit_arima_dcmp |> filter(Travel_Dir == 3) |> augment() |>
+  ggplot(aes(x = .fitted, y = .innov)) +
+  geom_point() + labs(x = "Fitted", y = "Residuals")
+```
+```{r}
+forecast(fit_arima_dcmp, new_data = test_dcmp) |>
+  filter(Travel_Dir == 3) |>
+  autoplot(tail(train |> filter(Travel_Dir == 3), 90)) +
+  autolayer(
+    test |> filter(Travel_Dir == 3),
+    colour = "black"
+  ) +
+  labs(title = "Traffic Volume Forecast",
+       y="Traffic count")
+```
